@@ -1,5 +1,6 @@
 use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use futures::sync::mpsc::UnboundedSender;
 use labrpc::RpcFuture;
@@ -14,6 +15,9 @@ mod tests;
 use self::errors::*;
 use self::persister::*;
 use crate::proto::raftpb::*;
+use futures::sync::oneshot;
+use futures::Future;
+use std::process::id;
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -39,6 +43,21 @@ impl State {
     }
 }
 
+// log entry.
+struct Entry {
+    command: Vec<u8>,
+    term: u64,
+}
+
+impl Entry {
+    fn new() -> Self {
+        Entry {
+            command: Vec::new(),
+            term: 0,
+        }
+    }
+}
+
 // A single Raft peer.
 pub struct Raft {
     // RPC end points of all peers
@@ -51,6 +70,15 @@ pub struct Raft {
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
+    voted_for: Option<usize>,
+    log: Vec<Entry>,
+    commit_index: u64,
+    last_applied: u64,
+    apply_channel: UnboundedSender<ApplyMsg>,
+
+    // Volatile state on leaders.
+    next_index: Vec<u64>,
+    match_index: Vec<u64>,
 }
 
 impl Raft {
@@ -71,17 +99,25 @@ impl Raft {
         let raft_state = persister.raft_state();
 
         // Your initialization code here (2A, 2B, 2C).
+        let num_rafts = peers.len();
         let mut rf = Raft {
             peers,
             persister,
             me,
             state: Arc::default(),
+            voted_for: None,
+            log: vec![Entry::new()],
+            commit_index: 0,
+            last_applied: 0,
+            apply_channel: apply_ch,
+            next_index: vec![0; num_rafts],
+            match_index: vec![0; num_rafts],
         };
 
         // initialize from state persisted before a crash
         rf.restore(&raft_state);
 
-        crate::your_code_here((rf, apply_ch))
+        rf
     }
 
     /// save Raft's persistent state to stable storage,
@@ -139,20 +175,18 @@ impl Raft {
         // Your code here if you want the rpc becomes async.
         // Example:
         // ```
-        // let peer = &self.peers[server];
-        // let (tx, rx) = channel();
-        // peer.spawn(
-        //     peer.request_vote(&args)
-        //         .map_err(Error::Rpc)
-        //         .then(move |res| {
-        //             tx.send(res);
-        //             Ok(())
-        //         }),
-        // );
-        // rx
-        // ```
-        let (tx, rx) = sync_channel::<Result<RequestVoteReply>>(1);
-        crate::your_code_here((server, args, tx, rx))
+        let peer = &self.peers[server];
+        let (tx, rx) = sync_channel(1);
+        peer.spawn(
+            peer.request_vote(&args)
+                .map_err(Error::Rpc)
+                .then(move |res| {
+                    tx.send(res)
+                        .expect("send RpcFuture<RequestVoteReply> failed.");
+                    Ok(())
+                }),
+        );
+        rx
     }
 
     fn start<M>(&self, command: &M) -> Result<(u64, u64)>
@@ -205,13 +239,16 @@ impl Raft {
 #[derive(Clone)]
 pub struct Node {
     // Your code here.
+    raft: Arc<Mutex<Raft>>,
 }
 
 impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
-        crate::your_code_here(raft)
+        Node {
+            raft: Arc::new(Mutex::new(raft)),
+        }
     }
 
     /// the service using Raft (e.g. a k/v server) wants to start
@@ -233,7 +270,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        crate::your_code_here(command)
+        self.raft.lock().unwrap().start(command)
     }
 
     /// The current term of this peer.
@@ -241,7 +278,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.term
-        crate::your_code_here(())
+        self.raft.lock().unwrap().state.term
     }
 
     /// Whether this peer believes it is the leader.
@@ -249,7 +286,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.leader_id == self.id
-        crate::your_code_here(())
+        self.raft.lock().unwrap().state.is_leader()
     }
 
     /// The current state of this peer.
@@ -271,6 +308,130 @@ impl Node {
     pub fn kill(&self) {
         // Your code here, if desired.
     }
+
+    pub fn request_vote_handle(
+        &self,
+        args: RequestVoteArgs,
+    ) -> oneshot::Receiver<RequestVoteReply> {
+        let raft = self.raft.clone();
+        let (sender, receiver) = oneshot::channel();
+
+        thread::spawn(move || {
+            let mut raft = raft.lock().expect("lock raft peer failed");
+            let term = raft.state.term;
+            let mut vote_granted = false;
+
+            if args.term < term {
+                sender
+                    .send(RequestVoteReply { term, vote_granted })
+                    .expect("send requestVoteReply failed");
+                return;
+            }
+
+            let check_log = || {
+                let last_log = raft.log.last();
+                match last_log {
+                    None => true,
+                    Some(log) => {
+                        if log.term <= args.last_log_term
+                            && raft.log.len() as u64 <= args.last_log_index
+                        {
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+            };
+
+            let voted_for = raft.voted_for;
+            if (voted_for.is_none() || voted_for.unwrap() as u64 == args.candidate_id)
+                && check_log()
+            {
+                vote_granted = true;
+                raft.voted_for = Some(args.candidate_id as usize);
+            }
+
+            sender
+                .send(RequestVoteReply { term, vote_granted })
+                .expect("send requestVoteReply failed");
+        });
+
+        receiver
+    }
+
+    pub fn append_entries_handle(
+        &self,
+        args: AppendEntriesArgs,
+    ) -> oneshot::Receiver<AppendEntriesReply> {
+        let raft = self.raft.clone();
+        let (sender, receiver) = oneshot::channel();
+
+        thread::spawn(move || {
+            let mut raft = raft.lock().expect("lock raft peer failed");
+            let current_term = raft.state.term;
+
+            // reply false if term < currentTerm
+            if args.term < current_term {
+                sender
+                    .send(AppendEntriesReply {
+                        term: current_term,
+                        success: false,
+                    })
+                    .expect("send AppendEntries failed.");
+                return;
+            }
+
+            // reply false if log doesn't contain an entry at prevLogIndex
+            // whose term matches prevLogTerm.
+            let prev_log_index = args.prev_log_index as usize;
+            let prev_log_term = args.prev_log_term;
+            let log_length = raft.log.len();
+
+            if log_length <= prev_log_index || raft.log[prev_log_index].term != prev_log_term {
+                sender
+                    .send(AppendEntriesReply {
+                        term: current_term,
+                        success: false,
+                    })
+                    .expect("send AppendEntries failed.");
+                return;
+            }
+
+            // if an existing entry conflicts with a new one, delete the existing
+            // entry and all that follow it.
+            let mut entries = args.entries;
+            for idx in 0..entries.len() {
+                // skip entries already in the log.
+                let idx_in_log = idx + prev_log_index + 1;
+                if idx_in_log < log_length && raft.log[idx_in_log].term == entries[idx].term {
+                    continue;
+                }
+
+                // delete conflict entry and all succeeding entries.
+                if raft.log[idx_in_log].term != entries[idx].term {
+                    raft.log.truncate(idx_in_log);
+                }
+
+                // append entries not in log.
+                for entry in entries.drain(idx..) {
+                    raft.log.push(Entry {
+                        command: entry.command,
+                        term: entry.term,
+                    });
+                }
+                break;
+            }
+
+            // if leaderCommit > commitIndex, set
+            // commitIndex = min(leaderCommit, index of last new entry.
+            if args.leader_commit > raft.commit_index {
+                raft.commit_index = std::cmp::min(args.leader_commit, raft.log.len() as u64 - 1);
+            }
+        });
+
+        receiver
+    }
 }
 
 impl RaftService for Node {
@@ -279,6 +440,14 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     fn request_vote(&self, args: RequestVoteArgs) -> RpcFuture<RequestVoteReply> {
         // Your code here (2A, 2B).
-        crate::your_code_here(args)
+        let reply = self.request_vote_handle(args).map_err(labrpc::Error::Recv);
+        Box::new(reply)
+    }
+
+    fn append_entries(&self, args: AppendEntriesArgs) -> RpcFuture<AppendEntriesReply> {
+        let reply = self
+            .append_entries_handle(args)
+            .map_err(labrpc::Error::Recv);
+        Box::new(reply)
     }
 }
