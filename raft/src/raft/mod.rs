@@ -49,6 +49,13 @@ struct Entry {
     term: u64,
 }
 
+// change state message.
+enum ServerState {
+    Follower,
+    Candidate,
+    Leader,
+}
+
 impl Entry {
     fn new() -> Self {
         Entry {
