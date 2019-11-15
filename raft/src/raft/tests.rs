@@ -59,6 +59,7 @@ fn test_reelection_2a() {
 
     let leader1 = cfg.check_one_leader();
     // if the leader disconnects, a new one should be elected.
+    println!("disconnect {}", leader1);
     cfg.disconnect(leader1);
     cfg.check_one_leader();
 
