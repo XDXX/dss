@@ -16,7 +16,7 @@ use self::persister::*;
 use crate::proto::raftpb::*;
 
 // use some crates
-use crossbeam_channel::select;
+use crossbeam_channel;
 use futures::future::Loop;
 use futures::sync::oneshot;
 use futures::{future, Future};
@@ -306,9 +306,6 @@ impl Raft {
 pub struct Node {
     // Your code here.
     raft: Arc<Mutex<Raft>>,
-
-    // for debug
-    me: usize,
 }
 
 impl Node {
@@ -316,7 +313,6 @@ impl Node {
     pub fn new(raft: Raft) -> Node {
         // Your code here.
         let node = Node {
-            me: raft.me,
             raft: Arc::new(Mutex::new(raft)),
         };
 
@@ -324,9 +320,9 @@ impl Node {
         let raft_state_machine = future::loop_fn((start_state, node.clone()), |args| {
             let (state, node) = args;
             match state {
-                ServerState::Follower => {println!("peer {} to follower", node.me); node.start_follower()}
-                ServerState::Candidate => {println!("peer {} to candidate", node.me); node.start_candidate()}
-                ServerState::Leader => {println!("peer {} to leader", node.me); node.start_leader()}
+                ServerState::Follower => node.start_follower(),
+                ServerState::Candidate => node.start_candidate(),
+                ServerState::Leader => node.start_leader(),
             }
         });
 
@@ -409,7 +405,7 @@ impl Node {
         let timeout = Duration::from_millis(timeout);
 
         thread::spawn(move || loop {
-            select! {
+            crossbeam_channel::select! {
                 recv(to_follower_rx) -> _ => continue,
                 default(timeout) => {
                     let _ = sender.send(Loop::Continue((ServerState::Candidate, node)));
@@ -461,9 +457,8 @@ impl Node {
             let to_leader_tx = to_leader_tx.clone();
 
             thread::spawn(move || {
-                match reply.recv() {
-                    Ok(result) if result.is_ok() => {
-                        let result = result.unwrap();
+                if let Ok(reply) = reply.recv() {
+                    if let Ok(result) = reply {
                         if result.term > current_term {
                             let mut raft = raft.lock().expect("lock raft peer failed");
                             raft.current_term = result.term;
@@ -481,8 +476,7 @@ impl Node {
                             }
                         }
                     }
-                    _ => (),
-                };
+                }
             });
         }
 
@@ -490,7 +484,7 @@ impl Node {
             // move vote_rx to this scope to keep the vote channel connected.
             vote_rx.is_empty();
 
-            select! {
+            crossbeam_channel::select! {
                 recv(to_leader_rx) -> _ => sender.send(Loop::Continue((ServerState::Leader, node))),
                 recv(to_follower_rx) -> _ => sender.send(Loop::Continue((ServerState::Follower, node))),
                 default(timeout) => sender.send(Loop::Continue((ServerState::Candidate, node))),
@@ -542,7 +536,10 @@ impl Node {
         thread::spawn(move || loop {
             match append_entries_reply_rx.recv() {
                 Err(_) => return,
-                Ok(reply) if reply.is_ok() => {
+                Ok(reply) => {
+                    if reply.is_err() {
+                        continue;
+                    }
                     let reply = reply.unwrap();
                     if reply.term > current_term {
                         let mut raft = raft.lock().expect("lock raft peer failed");
@@ -552,8 +549,7 @@ impl Node {
                             .expect("send follower state failed");
                         return;
                     }
-                },
-                _ => (),
+                }
             }
         });
         //TODO: log replication
@@ -597,7 +593,6 @@ impl Node {
 
         thread::spawn(move || {
             let mut raft = raft.lock().expect("lock raft peer failed");
-            println!("{} receive request vote from {}", raft.me, args.candidate_id);
             let term = raft.current_term;
             let mut vote_granted = false;
 
@@ -630,7 +625,6 @@ impl Node {
             {
                 vote_granted = true;
                 raft.voted_for = Some(args.candidate_id as usize);
-                println!("{} vote for {}", raft.me, args.candidate_id);
             }
 
             sender
