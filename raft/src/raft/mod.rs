@@ -1,5 +1,5 @@
 use std::sync::mpsc::{sync_channel, Receiver};
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 use futures::sync::mpsc::UnboundedSender;
 use labrpc::RpcFuture;
@@ -26,9 +26,10 @@ use std::thread;
 use std::time::Duration;
 
 // add some constants
-const ELECTION_TIMEOUTS_LOWER_BOUND: u64 = 300;
-const ELECTION_TIMEOUTS_UPPER_BOUND: u64 = 500;
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(150);
+// timeouts in original paper work fine.
+const ELECTION_TIMEOUTS_LOWER_BOUND: u64 = 150;
+const ELECTION_TIMEOUTS_UPPER_BOUND: u64 = 300;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(75);
 
 pub struct ApplyMsg {
     pub command_valid: bool,
@@ -104,9 +105,6 @@ pub struct Raft {
     to_follower_rx: crossbeam_channel::Receiver<bool>,
     to_follower_tx: crossbeam_channel::Sender<bool>,
 
-    to_candidate_rx: crossbeam_channel::Receiver<bool>,
-    to_candidate_tx: crossbeam_channel::Sender<bool>,
-
     to_leader_rx: crossbeam_channel::Receiver<bool>,
     to_leader_tx: crossbeam_channel::Sender<bool>,
 }
@@ -133,7 +131,6 @@ impl Raft {
 
         // initialize channels
         let (to_follower_tx, to_follower_rx) = crossbeam_channel::unbounded();
-        let (to_candidate_tx, to_candidate_rx) = crossbeam_channel::unbounded();
         let (to_leader_tx, to_leader_rx) = crossbeam_channel::unbounded();
 
         let mut rf = Raft {
@@ -152,8 +149,6 @@ impl Raft {
             match_index: vec![0; num_rafts],
             to_follower_rx,
             to_follower_tx,
-            to_candidate_rx,
-            to_candidate_tx,
             to_leader_rx,
             to_leader_tx,
         };
@@ -283,8 +278,7 @@ impl Raft {
 
         let _ = &self.last_applied;
         let _ = &self.apply_channel;
-        let _ = &self.to_candidate_rx;
-        let _ = &self.to_candidate_tx;
+        let _ = &self.match_index;
     }
 }
 
@@ -316,6 +310,8 @@ impl Node {
             raft: Arc::new(Mutex::new(raft)),
         };
 
+        // Start raft state machine with follower init state.
+        // The state machine drive by thread pool inner Clients as a future.
         let start_state = ServerState::Follower;
         let raft_state_machine = future::loop_fn((start_state, node.clone()), |args| {
             let (state, node) = args;
@@ -392,18 +388,19 @@ impl Node {
         // Your code here, if desired.
     }
 
+    // convert raft state to follower.
     fn start_follower(&self) -> oneshot::Receiver<Loop<(), (ServerState, Node)>> {
         let (sender, receiver) = oneshot::channel();
         let node = self.clone();
 
-        let mut raft = self.raft.lock().expect("lock raft peer failed");
-        raft.leader_id = None;
-        raft.voted_for = None;
+        let raft = self.raft.lock().expect("lock raft peer failed");
         let to_follower_rx = raft.to_follower_rx.clone();
         let timeout: u64 = rand::thread_rng()
             .gen_range(ELECTION_TIMEOUTS_LOWER_BOUND, ELECTION_TIMEOUTS_UPPER_BOUND);
         let timeout = Duration::from_millis(timeout);
 
+        // If election timeout elapses without receiving AppendEntries RPC from current leader
+        // or granting vote to candidate: convert to candidate.
         thread::spawn(move || loop {
             crossbeam_channel::select! {
                 recv(to_follower_rx) -> _ => continue,
@@ -417,10 +414,12 @@ impl Node {
         receiver
     }
 
+    // convert raft state to candidate
     fn start_candidate(&self) -> oneshot::Receiver<Loop<(), (ServerState, Node)>> {
         let (sender, receiver) = oneshot::channel();
         let node = self.clone();
 
+        // fetch some values from raft peer and do some reinitialization.
         let mut raft = self.raft.lock().expect("lock raft peer failed");
         let to_follower_rx = raft.to_follower_rx.clone();
         let to_follower_tx = raft.to_follower_tx.clone();
@@ -429,15 +428,18 @@ impl Node {
         let raft_peer_num = raft.peers.len();
         raft.current_term += 1;
         raft.voted_for = Some(raft.me);
+        raft.leader_id = None;
         let current_term = raft.current_term;
 
         let mut request_vote_reply_vec = Vec::new();
         let request_vote_args = RequestVoteArgs {
             term: raft.current_term,
             candidate_id: raft.me as u64,
-            last_log_index: raft.log.len() as u64,
+            last_log_index: (raft.log.len() - 1) as u64,
             last_log_term: raft.log.last().unwrap().term,
         };
+
+        // send RequestVote RPCs to all other servers.
         for i in 0..raft_peer_num {
             if i != raft.me {
                 request_vote_reply_vec.push(raft.send_request_vote(i, &request_vote_args));
@@ -450,6 +452,7 @@ impl Node {
         let timeout = Duration::from_millis(timeout);
         let (vote_tx, vote_rx) = crossbeam_channel::bounded(raft_peer_num / 2);
 
+        // response to request vote result.
         for reply in request_vote_reply_vec {
             let vote_tx = vote_tx.clone();
             let raft = self.raft.clone();
@@ -459,18 +462,22 @@ impl Node {
             thread::spawn(move || {
                 if let Ok(reply) = reply.recv() {
                     if let Ok(result) = reply {
+                        // get a bigger term, convert to follower.
                         if result.term > current_term {
                             let mut raft = raft.lock().expect("lock raft peer failed");
                             raft.current_term = result.term;
+                            raft.voted_for = None;
+                            raft.leader_id = None;
                             to_follower_tx
                                 .send(true)
                                 .expect("send follower state faild");
+                            return;
                         } else if result.vote_granted {
                             match vote_tx.send(true) {
                                 Ok(_) => (),
                                 Err(_) => return,
                             };
-
+                            // receive votes from majority of servers: become leader.
                             if vote_tx.is_full() {
                                 to_leader_tx.send(true).expect("send leader state failed");
                             }
@@ -480,6 +487,7 @@ impl Node {
             });
         }
 
+        // convert from current candidate state to other state.
         thread::spawn(move || {
             // move vote_rx to this scope to keep the vote channel connected.
             vote_rx.is_empty();
@@ -494,10 +502,12 @@ impl Node {
         receiver
     }
 
+    // convert raft state to leader
     fn start_leader(&self) -> oneshot::Receiver<Loop<(), (ServerState, Node)>> {
         let (sender, receiver) = oneshot::channel();
         let node = self.clone();
 
+        // fetch some values from raft peer and do some reinitialization.
         let mut raft = self.raft.lock().expect("lock raft peer failed");
         let to_follower_tx = raft.to_follower_tx.clone();
         let to_follower_rx = raft.to_follower_rx.clone();
@@ -506,30 +516,35 @@ impl Node {
         let current_term = raft.current_term;
 
         raft.leader_id = Some(raft.me);
-        raft.next_index = vec![raft.log.len(), raft_peer_num];
-        raft.match_index = vec![0, raft_peer_num];
+        raft.next_index = vec![raft.log.len(); raft_peer_num];
         drop(raft);
 
+        // send heartbeat to all other servers repeatedly.
         let (append_entries_reply_tx, append_entries_reply_rx) = crossbeam_channel::unbounded();
-
-        for i in 0..raft_peer_num {
-            if i != leader_id {
-                let node = node.clone();
-                let reply_tx = append_entries_reply_tx.clone();
-                thread::spawn(move || loop {
-                    if node.is_leader() {
-                        let args = node.get_append_entries_args(Vec::new(), (0, 0));
-                        node.raft
-                            .lock()
-                            .unwrap()
-                            .send_append_entries(i, &args, reply_tx.clone());
-                    } else {
-                        return;
+        let node_mv = node.clone();
+        let append_entries_reply_tx_mv = append_entries_reply_tx.clone();
+        thread::spawn(move || loop {
+            let node = node_mv.clone();
+            if node.is_leader() {
+                let raft = node.raft.lock().expect("lock raft peer failed.");
+                for i in 0..raft_peer_num {
+                    if i != leader_id {
+                        let next_index = raft.next_index[i];
+                        let prev_log_term = raft.log[next_index - 1].term;
+                        let prev_log_index = (next_index - 1) as u64;
+                        let args = node.get_append_entries_args(
+                            &raft,
+                            Vec::new(),
+                            (prev_log_index, prev_log_term),
+                        );
+                        raft.send_append_entries(i, &args, append_entries_reply_tx_mv.clone());
                     }
-                    thread::sleep(HEARTBEAT_INTERVAL);
-                });
+                }
+            } else {
+                return;
             }
-        }
+            thread::sleep(HEARTBEAT_INTERVAL);
+        });
 
         // response to AppendEntries RPC reply
         let raft = node.raft.clone();
@@ -541,9 +556,12 @@ impl Node {
                         continue;
                     }
                     let reply = reply.unwrap();
+                    let mut raft = raft.lock().expect("lock raft peer failed");
+                    // get a bigger term, convert to follower.
                     if reply.term > current_term {
-                        let mut raft = raft.lock().expect("lock raft peer failed");
                         raft.current_term = reply.term;
+                        raft.voted_for = None;
+                        raft.leader_id = None;
                         to_follower_tx
                             .send(true)
                             .expect("send follower state failed");
@@ -554,15 +572,19 @@ impl Node {
         });
         //TODO: log replication
 
+        // keep in leader state or convert to follower.
         thread::spawn(move || {
             to_follower_rx.recv().unwrap();
             let _ = sender.send(Loop::Continue((ServerState::Follower, node)));
         });
+
         receiver
     }
 
+    // helper to generate append_entries_args.
     fn get_append_entries_args(
         &self,
+        raft: &MutexGuard<Raft>,
         entries: Vec<Entry>,
         prev_log: (u64, u64),
     ) -> AppendEntriesArgs {
@@ -573,7 +595,7 @@ impl Node {
                 term: entry.term,
             });
         }
-        let raft = self.raft.lock().expect("lock raft peer failed");
+
         AppendEntriesArgs {
             term: raft.current_term,
             leader_id: raft.me as u64,
@@ -584,6 +606,7 @@ impl Node {
         }
     }
 
+    // receiver implementation of RequestVote RPC
     pub fn request_vote_handle(
         &self,
         args: RequestVoteArgs,
@@ -591,35 +614,47 @@ impl Node {
         let raft = self.raft.clone();
         let (sender, receiver) = oneshot::channel();
 
+        // don't block the current thread.
         thread::spawn(move || {
             let mut raft = raft.lock().expect("lock raft peer failed");
             let term = raft.current_term;
             let mut vote_granted = false;
 
+            // reply false if term < currentTerm
             if args.term < term {
                 sender
                     .send(RequestVoteReply { term, vote_granted })
                     .expect("send requestVoteReply failed");
                 return;
             } else if args.term > term {
+                // get a bigger term, convert to follower.
                 raft.current_term = args.term;
-                raft.to_follower_tx
-                    .send(true)
-                    .expect("send follower state failed");
+
+                if raft.voted_for.is_some() {
+                    raft.to_follower_tx
+                        .send(true)
+                        .expect("send follower state failed");
+                }
+                raft.voted_for = None;
+                raft.leader_id = None;
             }
 
+            // check if the candidate's log is at least as up-to-date as receiver's log
             let check_log = || {
                 let last_log = raft.log.last();
                 match last_log {
-                    None => true,
+                    None => panic!("Empty log[] in peer {}", raft.me),
                     Some(log) => {
-                        log.term <= args.last_log_term
-                            && raft.log.len() as u64 <= args.last_log_index
+                        log.term < args.last_log_term
+                            || (log.term == args.last_log_term
+                                && (raft.log.len() - 1) as u64 <= args.last_log_index)
                     }
                 }
             };
 
             let voted_for = raft.voted_for;
+
+            // if votedFor is null or candidateId, and candidate's log is up-to-date, grant vote
             if (voted_for.is_none() || voted_for.unwrap() as u64 == args.candidate_id)
                 && check_log()
             {
@@ -628,13 +663,17 @@ impl Node {
             }
 
             sender
-                .send(RequestVoteReply { term, vote_granted })
+                .send(RequestVoteReply {
+                    term: raft.current_term,
+                    vote_granted,
+                })
                 .expect("send requestVoteReply failed");
         });
 
         receiver
     }
 
+    // receiver implementation of AppendEntries RPC
     pub fn append_entries_handle(
         &self,
         args: AppendEntriesArgs,
@@ -655,14 +694,17 @@ impl Node {
                     })
                     .expect("send AppendEntries failed.");
                 return;
-            } else if args.term >= current_term {
-                raft.current_term = args.term;
+            } else {
+                // get a bigger term, convert to follower.
+                if args.term > current_term {
+                    raft.current_term = args.term;
+                    raft.voted_for = None;
+                }
                 raft.leader_id = Some(args.leader_id as usize);
                 raft.to_follower_tx
                     .send(true)
                     .expect("send follower state failed");
             }
-
             // reply false if log doesn't contain an entry at prevLogIndex
             // whose term matches prevLogTerm.
             let prev_log_index = args.prev_log_index as usize;
@@ -681,24 +723,15 @@ impl Node {
 
             // if an existing entry conflicts with a new one, delete the existing
             // entry and all that follow it.
-            let mut entries = args.entries;
-            for idx in 0..entries.len() {
-                // skip entries already in the log.
-                let idx_in_log = idx + prev_log_index + 1;
-                if idx_in_log < log_length && raft.log[idx_in_log].term == entries[idx].term {
-                    continue;
-                } else if idx_in_log < log_length {
-                    raft.log.truncate(idx_in_log);
-                }
-
-                // append entries not in log.
-                for entry in entries.drain(idx..) {
-                    raft.log.push(Entry {
-                        command: entry.command,
-                        term: entry.term,
-                    });
-                }
-                break;
+            let entries = args.entries;
+            if raft.log.len() > prev_log_index + 1 {
+                raft.log.truncate(prev_log_index + 1);
+            }
+            for entry in entries {
+                raft.log.push(Entry {
+                    command: entry.command,
+                    term: entry.term,
+                })
             }
 
             // if leaderCommit > commitIndex, set
@@ -706,6 +739,13 @@ impl Node {
             if args.leader_commit > raft.commit_index {
                 raft.commit_index = std::cmp::min(args.leader_commit, raft.log.len() as u64 - 1);
             }
+
+            sender
+                .send(AppendEntriesReply {
+                    term: raft.current_term,
+                    success: true,
+                })
+                .expect("send AppendEntries failed.");
         });
 
         receiver
