@@ -175,6 +175,25 @@ impl Raft {
         // labcodec::encode(&self.xxx, &mut data).unwrap();
         // labcodec::encode(&self.yyy, &mut data).unwrap();
         // self.persister.save_raft_state(data);
+        let mut data = Vec::new();
+        let voted_for = match self.voted_for {
+            Some(peer) => peer as i64,
+            None => -1,
+        };
+        let mut entries = Vec::with_capacity(self.log.len());
+        for log in &self.log {
+            entries.push(MsgEntry {
+                command: log.command.clone(),
+                term: log.term,
+            })
+        }
+        let msg = PersistMsg {
+            current_term: self.current_term,
+            voted_for,
+            entries,
+        };
+        labcodec::encode(&msg, &mut data).unwrap();
+        self.persister.save_raft_state(data);
     }
 
     /// restore previously persisted state.
@@ -194,6 +213,24 @@ impl Raft {
         //         panic!("{:?}", e);
         //     }
         // }
+        match labcodec::decode::<PersistMsg>(data) {
+            Ok(persist_msg) => {
+                self.current_term = persist_msg.current_term;
+                self.voted_for = match persist_msg.voted_for {
+                    peer if peer > 0 => Some(peer as usize),
+                    _ => None,
+                };
+                let mut log: Vec<Entry> = Vec::with_capacity(persist_msg.entries.len());
+                for entry in persist_msg.entries {
+                    log.push(Entry {
+                        command: entry.command,
+                        term: entry.term,
+                    });
+                }
+                self.log = log;
+            }
+            Err(e) => panic!("{:?}", e),
+        };
     }
 
     /// example code to send a RequestVote RPC to a server.
@@ -271,6 +308,7 @@ impl Raft {
                     .expect("apply command to state machine failed.")
             }
             self.last_applied = self.commit_index;
+            self.persist();
         }
     }
 
@@ -296,6 +334,7 @@ impl Raft {
                         .expect("send to log_replication failed.");
                 }
             }
+            self.persist();
             Ok((index, term))
         } else {
             Err(Error::NotLeader)
@@ -593,11 +632,16 @@ impl Node {
 
         // response to AppendEntries RPC reply
         let raft = node.raft.clone();
+        let log_replication_mv = log_replication.clone();
         thread::spawn(move || loop {
             match append_entries_reply_rx.recv() {
                 Err(_) => return,
                 Ok((reply, last_index, server)) => {
                     if reply.is_err() {
+                        log_replication_mv[server]
+                            .0
+                            .send(true)
+                            .expect("call AppendEntries RPC failed and re-call also failed");
                         continue;
                     }
                     let reply = reply.unwrap();
@@ -704,7 +748,7 @@ impl Node {
     ) -> AppendEntriesArgs {
         let mut vec = Vec::with_capacity(entries.len());
         for entry in entries {
-            vec.push(append_entries_args::Entry {
+            vec.push(MsgEntry {
                 command: entry.command,
                 term: entry.term,
             });
@@ -731,6 +775,7 @@ impl Node {
         // don't block the current thread.
         thread::spawn(move || {
             let mut raft = raft.lock().expect("lock raft peer failed");
+            raft.persist();
             let term = raft.current_term;
             let mut vote_granted = false;
 
@@ -797,6 +842,7 @@ impl Node {
 
         thread::spawn(move || {
             let mut raft = raft.lock().expect("lock raft peer failed");
+            raft.persist();
             let current_term = raft.current_term;
 
             // reply false if term < currentTerm
