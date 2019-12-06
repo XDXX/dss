@@ -109,6 +109,9 @@ pub struct Raft {
     to_leader_rx: crossbeam_channel::Receiver<bool>,
     to_leader_tx: crossbeam_channel::Sender<bool>,
 
+    exit_rx: crossbeam_channel::Receiver<bool>,
+    exit_tx: crossbeam_channel::Sender<bool>,
+    
     log_replication: Vec<(
         crossbeam_channel::Sender<bool>,
         crossbeam_channel::Receiver<bool>,
@@ -141,6 +144,7 @@ impl Raft {
         // initialize channels
         let (to_follower_tx, to_follower_rx) = crossbeam_channel::unbounded();
         let (to_leader_tx, to_leader_rx) = crossbeam_channel::unbounded();
+        let (exit_tx, exit_rx) = crossbeam_channel::unbounded();
 
         let mut rf = Raft {
             peers,
@@ -162,6 +166,8 @@ impl Raft {
             to_follower_tx,
             to_leader_rx,
             to_leader_tx,
+            exit_rx,
+            exit_tx,
         };
 
         // initialize from state persisted before a crash
@@ -469,6 +475,7 @@ impl Node {
         // Your code here, if desired.
         let mut raft = self.raft.lock().expect("lock raft peer failed");
         raft.is_alive = false;
+        raft.exit_tx.send(true).expect("send exit status failed");
     }
 
     // convert raft state to follower.
@@ -478,6 +485,7 @@ impl Node {
 
         let raft = self.raft.lock().expect("lock raft peer failed");
         let to_follower_rx = raft.to_follower_rx.clone();
+        let exit_rx = raft.exit_rx.clone();
         let timeout: u64 = rand::thread_rng()
             .gen_range(ELECTION_TIMEOUTS_LOWER_BOUND, ELECTION_TIMEOUTS_UPPER_BOUND);
         let timeout = Duration::from_millis(timeout);
@@ -487,6 +495,10 @@ impl Node {
         thread::spawn(move || loop {
             crossbeam_channel::select! {
                 recv(to_follower_rx) -> _ => continue,
+                recv(exit_rx) -> _ => {
+                    let _ = sender.send(Loop::Break(()));
+                    return;
+                }
                 default(timeout) => {
                     let _ = sender.send(Loop::Continue((ServerState::Candidate, node)));
                     return;
@@ -508,6 +520,7 @@ impl Node {
         let to_follower_tx = raft.to_follower_tx.clone();
         let to_leader_rx = raft.to_leader_rx.clone();
         let to_leader_tx = raft.to_leader_tx.clone();
+        let exit_rx = raft.exit_rx.clone();
         let raft_peer_num = raft.peers.len();
         raft.current_term += 1;
         raft.voted_for = Some(raft.me);
@@ -578,6 +591,7 @@ impl Node {
             crossbeam_channel::select! {
                 recv(to_leader_rx) -> _ => sender.send(Loop::Continue((ServerState::Leader, node))),
                 recv(to_follower_rx) -> _ => sender.send(Loop::Continue((ServerState::Follower, node))),
+                recv(exit_rx) -> _ => sender.send(Loop::Break(())),
                 default(timeout) => sender.send(Loop::Continue((ServerState::Candidate, node))),
             }
         });
@@ -594,6 +608,7 @@ impl Node {
         let mut raft = self.raft.lock().expect("lock raft peer failed");
         let to_follower_tx = raft.to_follower_tx.clone();
         let to_follower_rx = raft.to_follower_rx.clone();
+        let exit_rx = raft.exit_rx.clone();
         let raft_peer_num = raft.peers.len();
         let leader_id = raft.me;
         let current_term = raft.current_term;
@@ -752,8 +767,10 @@ impl Node {
 
         // keep in leader state or convert to follower.
         thread::spawn(move || {
-            to_follower_rx.recv().unwrap();
-            let _ = sender.send(Loop::Continue((ServerState::Follower, node)));
+            crossbeam_channel::select! {
+                recv(to_follower_rx) -> _ => sender.send(Loop::Continue((ServerState::Follower, node))),
+                recv(exit_rx) -> _ => sender.send(Loop::Break(())),
+            }
         });
 
         receiver
