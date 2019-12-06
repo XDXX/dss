@@ -113,6 +113,9 @@ pub struct Raft {
         crossbeam_channel::Sender<bool>,
         crossbeam_channel::Receiver<bool>,
     )>,
+
+    // Is this peer still alive?
+    is_alive: bool,
 }
 
 impl Raft {
@@ -154,6 +157,7 @@ impl Raft {
             next_index: vec![0; num_rafts],
             match_index: vec![0; num_rafts],
             log_replication: Vec::with_capacity(num_rafts),
+            is_alive: true,
             to_follower_rx,
             to_follower_tx,
             to_leader_rx,
@@ -463,6 +467,8 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // Your code here, if desired.
+        let mut raft = self.raft.lock().expect("lock raft peer failed");
+        raft.is_alive = false;
     }
 
     // convert raft state to follower.
@@ -611,14 +617,24 @@ impl Node {
             let node = node_mv.clone();
             if node.is_leader() {
                 let raft = node.raft.lock().expect("lock raft peer failed.");
+                if !raft.is_alive {
+                    return;
+                }
                 for i in 0..raft_peer_num {
                     if i != leader_id {
                         let next_index = raft.next_index[i];
                         let prev_log_term = raft.log[next_index - 1].term;
                         let prev_log_index = (next_index - 1) as u64;
+                        let last_log_index = raft.log.len() - 1;
+                        let entries = if last_log_index >= next_index {
+                            raft.log[next_index..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+
                         let args = node.get_append_entries_args(
                             &raft,
-                            Vec::new(),
+                            entries,
                             (prev_log_index, prev_log_term),
                         );
                         raft.send_append_entries(i, &args, append_entries_reply_tx_mv.clone());
@@ -646,6 +662,9 @@ impl Node {
                     }
                     let reply = reply.unwrap();
                     let mut raft = raft.lock().expect("lock raft peer failed");
+                    if !raft.is_alive {
+                        return;
+                    }
                     // get a bigger term, convert to follower.
                     if reply.term > current_term {
                         raft.current_term = reply.term;
@@ -711,6 +730,9 @@ impl Node {
                         return;
                     }
                     let raft = node.raft.lock().expect("lock raft peer failed.");
+                    if !raft.is_alive {
+                        return;
+                    }
                     let last_log_index = raft.log.len() - 1;
                     let next_index = raft.next_index[i];
                     if last_log_index >= next_index {
@@ -724,8 +746,6 @@ impl Node {
                         );
                         raft.send_append_entries(i, &args, append_entries_reply_tx.clone());
                     }
-                } else {
-                    return;
                 }
             });
         }
@@ -783,7 +803,7 @@ impl Node {
             if args.term < term {
                 sender
                     .send(RequestVoteReply { term, vote_granted })
-                    .expect("send requestVoteReply failed");
+                    .unwrap_or_else(|_| debug!("send requestVoteReply failed"));
                 return;
             } else if args.term > term {
                 // get a bigger term, convert to follower.
@@ -792,7 +812,7 @@ impl Node {
                 if raft.voted_for.is_some() {
                     raft.to_follower_tx
                         .send(true)
-                        .expect("send follower state failed");
+                        .unwrap_or_else(|_| debug!("send requestVoteReply failed"));
                 }
                 raft.voted_for = None;
                 raft.leader_id = None;
@@ -826,7 +846,7 @@ impl Node {
                     term: raft.current_term,
                     vote_granted,
                 })
-                .expect("send requestVoteReply failed");
+                .unwrap_or_else(|_| debug!("send requestVoteReply failed"));
         });
 
         receiver
@@ -852,7 +872,7 @@ impl Node {
                         term: current_term,
                         success: false,
                     })
-                    .expect("send AppendEntries failed.");
+                    .unwrap_or_else(|_| debug!("send AppendEntries failed."));
                 return;
             } else {
                 // get a bigger term, convert to follower.
@@ -877,21 +897,26 @@ impl Node {
                         term: raft.current_term,
                         success: false,
                     })
-                    .expect("send AppendEntries failed.");
+                    .unwrap_or_else(|_| debug!("send AppendEntries failed."));
                 return;
             }
 
             // if an existing entry conflicts with a new one, delete the existing
             // entry and all that follow it.
             let entries = args.entries;
-            if raft.log.len() > prev_log_index + 1 {
-                raft.log.truncate(prev_log_index + 1);
-            }
-            for entry in entries {
-                raft.log.push(Entry {
-                    command: entry.command,
-                    term: entry.term,
-                })
+            let log_len = raft.log.len();
+            for i in 0..entries.len() {
+                let idx_in_log = i + 1 + prev_log_index;
+                if idx_in_log < log_len && raft.log[idx_in_log].term == entries[i].term {
+                    continue;
+                }
+                raft.log.truncate(idx_in_log);
+                for entry in entries.iter().skip(i) {
+                    raft.log.push(Entry {
+                        command: entry.command.clone(),
+                        term: entry.term,
+                    });
+                }
             }
 
             // if leaderCommit > commitIndex, set
@@ -909,7 +934,7 @@ impl Node {
                     term: raft.current_term,
                     success: true,
                 })
-                .expect("send AppendEntries failed.");
+                .unwrap_or_else(|_| debug!("send AppendEntries failed."));
         });
 
         receiver
