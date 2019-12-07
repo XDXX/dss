@@ -39,6 +39,8 @@ message AppendEntriesArgs {
 message AppendEntriesReply {
     uint64 term = 1;
     bool success = 2;
+    uint64 conflict_term = 3;
+    uint64 idx_of_first = 4;
 }
 
 // persistent state structure.

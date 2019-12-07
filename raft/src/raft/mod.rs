@@ -111,7 +111,7 @@ pub struct Raft {
 
     exit_rx: crossbeam_channel::Receiver<bool>,
     exit_tx: crossbeam_channel::Sender<bool>,
-    
+
     log_replication: Vec<(
         crossbeam_channel::Sender<bool>,
         crossbeam_channel::Receiver<bool>,
@@ -718,9 +718,18 @@ impl Node {
                     } else {
                         // if appendEntries fails because of log inconsistency: decrement nextIndex
                         // and retry.
-                        if raft.next_index[server] > 1 {
-                            raft.next_index[server] -= 1;
+                        let mut back_idx = reply.idx_of_first as usize;
+                        if reply.conflict_term != 0 {
+                            for (idx, entry) in raft.log.iter().enumerate() {
+                                if entry.term == reply.conflict_term {
+                                    back_idx = idx + 1;
+                                } else if entry.term > reply.conflict_term {
+                                    break;
+                                }
+                            }
                         }
+                        raft.next_index[server] = std::cmp::max(back_idx, 1);
+
                         raft.log_replication[server]
                             .0
                             .send(true)
@@ -888,6 +897,8 @@ impl Node {
                     .send(AppendEntriesReply {
                         term: current_term,
                         success: false,
+                        conflict_term: 0,
+                        idx_of_first: 0,
                     })
                     .unwrap_or_else(|_| debug!("send AppendEntries failed."));
                 return;
@@ -909,10 +920,27 @@ impl Node {
             let log_length = raft.log.len();
 
             if log_length <= prev_log_index || raft.log[prev_log_index].term != prev_log_term {
+                let mut idx_of_first = 0;
+                let conflict_term;
+                if log_length <= prev_log_index {
+                    conflict_term = 0;
+                    idx_of_first = (raft.log.len() - 1) as u64;
+                } else {
+                    conflict_term = raft.log[prev_log_index].term;
+                    for (idx, entry) in raft.log.iter().enumerate() {
+                        if entry.term == conflict_term {
+                            idx_of_first = idx as u64;
+                            break;
+                        }
+                    }
+                };
+
                 sender
                     .send(AppendEntriesReply {
                         term: raft.current_term,
                         success: false,
+                        conflict_term,
+                        idx_of_first,
                     })
                     .unwrap_or_else(|_| debug!("send AppendEntries failed."));
                 return;
@@ -950,6 +978,8 @@ impl Node {
                 .send(AppendEntriesReply {
                     term: raft.current_term,
                     success: true,
+                    conflict_term: 0,
+                    idx_of_first: 0,
                 })
                 .unwrap_or_else(|_| debug!("send AppendEntries failed."));
         });
