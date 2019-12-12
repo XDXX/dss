@@ -112,6 +112,11 @@ pub struct Raft {
     exit_rx: crossbeam_channel::Receiver<bool>,
     exit_tx: crossbeam_channel::Sender<bool>,
 
+    log_replication: Vec<(
+        crossbeam_channel::Sender<bool>,
+        crossbeam_channel::Receiver<bool>,
+    )>,
+
     // Is this peer still alive?
     is_alive: bool,
 }
@@ -140,6 +145,10 @@ impl Raft {
         let (to_follower_tx, to_follower_rx) = crossbeam_channel::unbounded();
         let (to_leader_tx, to_leader_rx) = crossbeam_channel::unbounded();
         let (exit_tx, exit_rx) = crossbeam_channel::unbounded();
+        let mut log_replication = Vec::with_capacity(num_rafts);
+        for _ in 0..num_rafts {
+            log_replication.push(crossbeam_channel::unbounded());
+        }
 
         let mut rf = Raft {
             peers,
@@ -156,6 +165,7 @@ impl Raft {
             next_index: vec![0; num_rafts],
             match_index: vec![0; num_rafts],
             is_alive: true,
+            log_replication,
             to_follower_rx,
             to_follower_tx,
             to_leader_rx,
@@ -329,6 +339,15 @@ impl Raft {
 
         if is_leader {
             self.log.push(Entry { command: buf, term });
+            for i in 0..self.peers.len() {
+                if i != self.me {
+                    // notify other peers to replicate new command.
+                    self.log_replication[i]
+                        .0
+                        .send(true)
+                        .expect("send to log_replication failed.");
+                }
+            }
             self.persist();
             Ok((index, term))
         } else {
@@ -601,6 +620,7 @@ impl Node {
         raft.leader_id = Some(raft.me);
         raft.next_index = vec![raft.log.len(); raft_peer_num];
         raft.match_index = vec![0; raft_peer_num];
+        let log_replication = raft.log_replication.clone();
         drop(raft);
 
         // send heartbeat to all other servers repeatedly.
@@ -609,11 +629,8 @@ impl Node {
         let append_entries_reply_tx_mv = append_entries_reply_tx.clone();
         thread::spawn(move || loop {
             let node = node_mv.clone();
-            if node.is_leader() {
-                let raft = node.raft.lock().expect("lock raft peer failed.");
-                if !raft.is_alive {
-                    return;
-                }
+            let raft = node.raft.lock().expect("lock raft peer failed.");
+            if raft.leader_id == Some(raft.me) && raft.is_alive {
                 for i in 0..raft_peer_num {
                     if i != leader_id {
                         let next_index = raft.next_index[i];
@@ -628,6 +645,7 @@ impl Node {
 
                         let args = node.get_append_entries_args(
                             &raft,
+                            current_term,
                             entries,
                             (prev_log_index, prev_log_term),
                         );
@@ -637,6 +655,7 @@ impl Node {
             } else {
                 return;
             }
+            drop(raft);
             thread::sleep(HEARTBEAT_INTERVAL);
         });
 
@@ -655,7 +674,7 @@ impl Node {
                         return;
                     }
                     // get a bigger term, convert to follower.
-                    if reply.term > current_term {
+                    if reply.term > raft.current_term {
                         raft.current_term = reply.term;
                         raft.voted_for = None;
                         raft.leader_id = None;
@@ -680,7 +699,7 @@ impl Node {
                                     count += 1;
                                     if (count >= raft_peer_num / 2)
                                         && last_index > raft.commit_index as usize
-                                        && raft.log[last_index].term == current_term
+                                        && raft.log[last_index].term == raft.current_term
                                     {
                                         raft.commit_index = last_index as u64;
                                         raft.check_and_apply_command();
@@ -703,10 +722,50 @@ impl Node {
                             }
                         }
                         raft.next_index[server] = std::cmp::max(back_idx, 1);
+
+                        raft.log_replication[server]
+                            .0
+                            .send(true)
+                            .expect("send to log_replication failed.");
                     }
                 }
             }
         });
+
+        // if last log index >= nextIndex for a follower: send AppendEntries RPC with log entries
+        // starting at nextIndex.
+        for (i, log_replication_ch) in log_replication.iter().enumerate() {
+            if i == leader_id {
+                continue;
+            }
+            let node = node.clone();
+            let log_replication_rx = log_replication_ch.1.clone();
+            let append_entries_reply_tx = append_entries_reply_tx.clone();
+            thread::spawn(move || loop {
+                if log_replication_rx.recv().is_ok() {
+                    let raft = node.raft.lock().expect("lock raft peer failed.");
+                    if raft.leader_id != Some(raft.me) || !raft.is_alive {
+                        return;
+                    }
+                    let last_log_index = raft.log.len() - 1;
+                    let next_index = raft.next_index[i];
+                    if last_log_index >= next_index {
+                        let entries = raft.log[next_index..].to_vec();
+                        let prev_log_term = raft.log[next_index - 1].term;
+                        let prev_log_index = (next_index - 1) as u64;
+                        let args = node.get_append_entries_args(
+                            &raft,
+                            current_term,
+                            entries,
+                            (prev_log_index, prev_log_term),
+                        );
+                        raft.send_append_entries(i, &args, append_entries_reply_tx.clone());
+                    }
+                } else {
+                    return;
+                }
+            });
+        }
 
         // keep in leader state or convert to follower.
         thread::spawn(move || {
@@ -723,6 +782,7 @@ impl Node {
     fn get_append_entries_args(
         &self,
         raft: &MutexGuard<Raft>,
+        current_term: u64,
         entries: Vec<Entry>,
         prev_log: (u64, u64),
     ) -> AppendEntriesArgs {
@@ -735,7 +795,7 @@ impl Node {
         }
 
         AppendEntriesArgs {
-            term: raft.current_term,
+            term: current_term,
             leader_id: raft.me as u64,
             prev_log_index: prev_log.0,
             prev_log_term: prev_log.1,
@@ -807,6 +867,12 @@ impl Node {
                     vote_granted,
                 })
                 .unwrap_or_else(|_| debug!("send requestVoteReply failed"));
+
+            if vote_granted {
+                raft.to_follower_tx
+                    .send(true)
+                    .unwrap_or_else(|_| debug!("send requestVoteReply failed"));
+            }
         });
 
         receiver
